@@ -1,0 +1,15 @@
+[project]
+name = "mirror-folder-batch"
+description = "Walk a folder tree one photo at a time and save the result under the same relative path."
+version = "1.0.0"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/polupavlik68/mirror-folder-batch"
+
+[tool.comfy]
+PublisherId = "polupavlik68"
+DisplayName = "Mirror Folder Batch"
+requires-comfyui = ">=0.3.0"
