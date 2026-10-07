@@ -70,11 +70,19 @@ function ensurePanel(node) {
 function showEstimate(node, text) {
 	const panel = ensurePanel(node);
 	const raw = text || "";
+	const photoMatch = raw.match(/это фото\s+([^,]+)/);
 	const leftMatch = raw.match(/осталось\s+~?\s*(.+)$/);
 	const avgMatch = raw.match(/среднее\s+([^,]+)/);
 	const countMatch = raw.match(/(\d+)\s*\/\s*(\d+)/);
 
-	if (leftMatch) {
+	if (photoMatch) {
+		panel.left.textContent = photoMatch[1].trim();
+		const bits = [];
+		if (countMatch) bits.push(`${countMatch[1]} из ${countMatch[2]}`);
+		if (leftMatch) bits.push(`осталось ${leftMatch[1].trim()}`);
+		if (avgMatch) bits.push(`среднее ${avgMatch[1].trim()}`);
+		panel.meta.textContent = bits.join("  ·  ");
+	} else if (leftMatch) {
 		panel.left.textContent = leftMatch[1].trim();
 		const bits = [];
 		if (countMatch) bits.push(`${countMatch[1]} из ${countMatch[2]}`);

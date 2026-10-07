@@ -22,7 +22,9 @@ _LANCZOS = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.L
 
 _ticks = 0
 _active_input = ""
-_starts: list[float] = []
+_photo_key = ""
+_photo_started = 0.0
+_durations: list[float] = []
 _last_eta = "жду второе фото"
 
 
@@ -34,23 +36,64 @@ def _fmt_duration(seconds: float) -> str:
     if minutes < 60:
         return f"{minutes} мин {sec} с" if sec else f"{minutes} мин"
     hours, minutes = divmod(minutes, 60)
+    if minutes == 0:
+        return f"{hours} ч"
     return f"{hours} ч {minutes} мин"
 
 
+def note_photo_start(key: str) -> None:
+    """Start the clock once per file. A second entry for the same file must not reset it."""
+    global _photo_key, _photo_started
+    if key == _photo_key and _photo_started:
+        return
+    _photo_key = key
+    _photo_started = time.time()
+
+
+def note_photo_saved(key: str) -> None:
+    """Keep the generation time only. Idle time before the next file is not a sample."""
+    global _photo_started
+    if not _photo_started or key != _photo_key:
+        return
+    duration = time.time() - _photo_started
+    _photo_started = 0.0
+    if duration < 1:
+        return
+    _durations.append(duration)
+    del _durations[:-40]
+
+
+def _median(samples: list[float]) -> float:
+    ordered = sorted(samples)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def _pace(samples: list[float]) -> float:
+    recent = samples[-20:]
+    typical = _median(recent)
+    # A pause or the first model load is one huge sample. Leave it out of the pace.
+    inliers = [item for item in recent if item <= max(typical * 3, typical + 30)]
+    if not inliers:
+        return typical
+    return sum(inliers) / len(inliers)
+
+
 def eta_message(index: int, total: int) -> str:
-    """Average gap between photos this session, then scale it to what is left."""
+    """Pace from finished photos in this server run, then scale it to what is left."""
     global _last_eta
-    _starts.append(time.time())
     number = index + 1
     left = max(0, total - index)
-    if len(_starts) < 2:
+    if not _durations:
         _last_eta = f"{number}/{total}, среднее появится со второго фото"
         return _last_eta
-    deltas = [_starts[i] - _starts[i - 1] for i in range(1, len(_starts))]
-    average = sum(deltas) / len(deltas)
+    pace = _pace(_durations)
     _last_eta = (
-        f"{number}/{total}, среднее {_fmt_duration(average)}, "
-        f"осталось ~{_fmt_duration(average * left)}"
+        f"{number}/{total}, это фото {_fmt_duration(_durations[-1])}, "
+        f"среднее {_fmt_duration(pace)}, "
+        f"осталось ~{_fmt_duration(pace * left)}"
     )
     return _last_eta
 
@@ -218,6 +261,7 @@ class MirrorFolderBatch:
         total = len(everything)
         path, relative = pending[0]
         index = total - len(pending)
+        note_photo_start(relative.as_posix())
         image = _resize_long_side(_load_rgb(path), int(max_side))
         message = eta_message(index, total)
         print(f"[Пакет] {index + 1}/{total} {relative.as_posix()} | {message}")
@@ -225,6 +269,51 @@ class MirrorFolderBatch:
             "ui": {"text": [message]},
             "result": (image, relative.as_posix(), output_folder),
         }
+
+
+class MirrorFolderWhite:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "threshold": ("INT", {
+                    "default": 248,
+                    "min": 200,
+                    "max": 255,
+                    "step": 1,
+                    "tooltip": "Пиксель светлее этого по всем каналам становится чистым белым 255.",
+                }),
+                "softness": ("INT", {
+                    "default": 8,
+                    "min": 0,
+                    "max": 40,
+                    "step": 1,
+                    "tooltip": "Мягкий переход ниже порога. Тень темнее этого остаётся как есть.",
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "apply"
+    CATEGORY = "image/batch"
+    DESCRIPTION = "Дожимает почти белый фон до 255,255,255. Более тёмные пиксели не меняет."
+
+    def apply(self, image, threshold, softness):
+        rgb = image[..., :3]
+        level = rgb.amin(dim=-1, keepdim=True)
+        hi = float(threshold) / 255.0
+        span = max(0.0, float(softness) / 255.0)
+        if span <= 0.0:
+            weight = (level >= hi).to(dtype=rgb.dtype)
+        else:
+            weight = ((level - (hi - span)) / span).clamp(0.0, 1.0)
+            weight = weight * weight * (3.0 - 2.0 * weight)
+        lifted = rgb * (1.0 - weight) + weight
+        if image.shape[-1] > 3:
+            lifted = torch.cat((lifted, image[..., 3:]), dim=-1)
+        return (lifted,)
 
 
 class MirrorFolderSave:
@@ -271,8 +360,23 @@ class MirrorFolderSave:
             picture.save(dest, format="PNG")
 
         print(f"[Сохранение] {dest}")
+        note_photo_saved(relative.as_posix())
         _queue_next(output_folder)
-        return (str(dest),)
+        # A temp preview is wiped from the queue as soon as the job finishes.
+        # An output file stays on the completed card, with the generation time.
+        return {"ui": {"images": [_ui_preview(picture, relative)]}, "result": (str(dest),)}
+
+
+def _ui_preview(picture: Image.Image, relative: Path) -> dict:
+    import folder_paths
+
+    subfolder = "mirror_batch"
+    folder = Path(folder_paths.get_output_directory()) / subfolder
+    folder.mkdir(parents=True, exist_ok=True)
+    stem = "".join(ch if ch not in '<>:"/\\|?*' else "_" for ch in (relative.stem or "image"))
+    filename = f"{stem}_{uuid.uuid4().hex[:6]}.jpg"
+    picture.save(folder / filename, format="JPEG", quality=90, subsampling=0)
+    return {"filename": filename, "subfolder": subfolder, "type": "output"}
 
 
 def _queue_next(output_folder: str) -> None:
@@ -296,8 +400,10 @@ def _queue_next(output_folder: str) -> None:
     item = copy.deepcopy(running[0])
     prompt_id = str(uuid.uuid4())
     number = float(item[0]) + 1
+    extra = item[3] if isinstance(item[3], dict) else {}
+    extra["create_time"] = int(time.time() * 1000)
     tail = item[5] if len(item) > 5 else {}
-    queue.put((number, prompt_id, item[2], item[3], item[4], tail))
+    queue.put((number, prompt_id, item[2], extra, item[4], tail))
     print(f"[Сохранение] следующее в очереди, осталось {len(pending)}")
 
 
@@ -335,9 +441,11 @@ WEB_DIRECTORY = "./web"
 
 NODE_CLASS_MAPPINGS = {
     "MirrorFolderBatch": MirrorFolderBatch,
+    "MirrorFolderWhite": MirrorFolderWhite,
     "MirrorFolderSave": MirrorFolderSave,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MirrorFolderBatch": "Пакетная обработка",
+    "MirrorFolderWhite": "Белый фон до 255",
     "MirrorFolderSave": "Сохранить в папки",
 }
